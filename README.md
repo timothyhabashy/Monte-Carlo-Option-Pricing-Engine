@@ -20,6 +20,9 @@ A small, self-contained Monte Carlo pricer for common equity options under GBM, 
 uv venv
 uv pip install -e .
 ```
+Open `nbs/ENGINE.ipynb` to run the engine.
+
+## NOTES:
 
 A UV file is included but just incase, the required packages are:
 numpy
@@ -27,5 +30,3 @@ matplotlib
 pandas
 dataclasses
 yfinance
-
-Open `nbs/ENGINE.ipynb` to run the engine.

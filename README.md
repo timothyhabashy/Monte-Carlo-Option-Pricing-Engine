@@ -21,4 +21,11 @@ uv venv
 uv pip install -e .
 ```
 
+A UV file is included but just incase, the required packages are:
+numpy
+matplotlib
+pandas
+dataclasses
+yfinance
+
 Open `nbs/ENGINE.ipynb` to run the engine.

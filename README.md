@@ -1,7 +1,10 @@
 # Monte Carlo Option Pricing Engine
 
-A GBM Monte Carlo pricer for common equity options. The engine lives in the
-`monte_carlo_option_engine` package; notebooks under `nbs/` are demo clients.
+[![CI](https://github.com/timothyhabashy/Monte-Carlo-Option-Pricing-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/timothyhabashy/Monte-Carlo-Option-Pricing-Engine/actions/workflows/ci.yml)
+
+A GBM Monte Carlo pricer for common equity options. Pricing lives in the
+`monte_carlo_option_engine` package (Python 3.13+); notebooks under `nbs/` are
+demo clients.
 
 ## Features
 
@@ -18,10 +21,19 @@ A GBM Monte Carlo pricer for common equity options. The engine lives in the
 - `market_from_yfinance(..., vol_source="historical"|"implied")`
 - CLI (`mcoe` / `python -m monte_carlo_option_engine`) and optional Streamlit UI
 
+## Install
+
+```bash
+git clone https://github.com/timothyhabashy/Monte-Carlo-Option-Pricing-Engine.git
+cd Monte-Carlo-Option-Pricing-Engine
+uv sync --group dev
+```
+
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.13+.
+
 ## Quick start
 
 ```bash
-uv sync --group dev
 uv run pytest -m "not network"
 ```
 
@@ -39,6 +51,16 @@ call = Contract(K=105, kind=ContractKind.euro_call)
 result = price_mc(market, call, trial_count=50_000, seed=0)
 print(result.price, result.stderr)
 print(black_scholes(market, call))
+```
+
+Greeks, American puts, Heston calls, and baskets use the same `Market` /
+`Contract` types:
+
+```python
+from monte_carlo_option_engine import greeks, price_american_put
+
+print(greeks(market, call, method="pathwise", trial_count=20_000, seed=0))
+print(price_american_put(market, strike=105, seed=0).price)
 ```
 
 ## Command line
@@ -80,6 +102,11 @@ exists.
 - `nbs/01_convergence.ipynb` — European call price vs number of paths
 - `nbs/02_variance_reduction.ipynb` — naive vs antithetic vs control-variate SEs
 
+## Tests
+
+CI runs `uv run pytest -m "not network"` on every push and pull request.
+Live Yahoo tests are marked `network` and stay off by default.
+
 ## Notes
 
 - Live `sigma` from Yahoo is historical by default; `vol_source="implied"`
@@ -87,3 +114,7 @@ exists.
 - Arithmetic Asians average the simulated grid after `t = 0` (they exclude `S0`).
 - Up-and-out barriers default to discrete monitoring; set
   `monitoring="continuous"` for the Broadie–Glasserman–Kou barrier shift.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

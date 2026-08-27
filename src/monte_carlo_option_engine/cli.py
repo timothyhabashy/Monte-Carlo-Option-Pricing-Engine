@@ -58,6 +58,21 @@ def _parser() -> argparse.ArgumentParser:
     price.add_argument("--seed", type=int, default=0)
     price.add_argument("--method", choices=("iid", "sobol"), default="iid")
     price.add_argument(
+        "--model",
+        choices=("gbm", "heston", "localvol"),
+        default="gbm",
+        help="Spot dynamics (default gbm)",
+    )
+    price.add_argument("--kappa", type=float, help="Heston mean reversion")
+    price.add_argument("--theta", type=float, help="Heston long-run variance")
+    price.add_argument("--xi", type=float, help="Heston vol-of-vol")
+    price.add_argument("--rho", type=float, help="Heston spot-vol correlation")
+    price.add_argument("--v0", type=float, help="Heston initial variance")
+    price.add_argument(
+        "--surface-ticker",
+        help="Yahoo ticker used to build a Dupire local-vol surface",
+    )
+    price.add_argument(
         "--vol-source",
         choices=("historical", "implied"),
         default="historical",
@@ -69,21 +84,54 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _format_result(contract: Contract, result: PriceResult, bs: float | None) -> str:
+def _format_result(
+    contract: Contract, result: PriceResult, bs: float | None, control_variate: bool
+) -> str:
     def fmt(x: float) -> str:
         return f"{x:,.6f}"
 
+    cv_tag = " | MC (CV)" if control_variate and bs is not None else ""
     lines = [
         f"{str(contract.kind):<15} price={fmt(result.price)} | "
         f"95% CI [{fmt(result.ci_low)}, {fmt(result.ci_high)}] | "
-        f"stderr={fmt(result.stderr)}"
+        f"stderr={fmt(result.stderr)}{cv_tag}"
     ]
     if bs is not None:
         lines.append(f"BS {contract.kind}: {fmt(bs)}")
     return "\n".join(lines)
 
 
+def _heston_params(args: argparse.Namespace):
+    missing = [
+        name
+        for name in ("kappa", "theta", "xi", "rho", "v0")
+        if getattr(args, name) is None
+    ]
+    if missing:
+        flags = ", ".join(f"--{name}" for name in missing)
+        raise ValueError(f"{flags} required for --model heston")
+    from monte_carlo_option_engine.heston import HestonParams
+
+    return HestonParams(
+        kappa=args.kappa,
+        theta=args.theta,
+        xi=args.xi,
+        rho=args.rho,
+        v0=args.v0,
+    )
+
+
 def _build_market(args: argparse.Namespace) -> Market:
+    if args.model == "localvol":
+        if not args.surface_ticker:
+            raise ValueError("--surface-ticker is required for --model localvol")
+        from monte_carlo_option_engine.marketdata import surface_from_yfinance
+
+        surface = surface_from_yfinance(args.surface_ticker, r=args.rate)
+        q = surface.q if args.div is None else args.div
+        sigma = 0.2 if args.sigma is None else args.sigma
+        args._surface = surface  # used by _build_process
+        return Market(S=surface.S, T=args.tenor, r=args.rate, q=q, sigma=sigma)
     if args.ticker:
         if args.spot is not None:
             raise ValueError("pass --ticker or --S, not both")
@@ -110,10 +158,36 @@ def _build_market(args: argparse.Namespace) -> Market:
         q = snap.q if args.div is None else args.div
         sigma = snap.sigma if args.sigma is None else args.sigma
         return Market(S=snap.S, T=args.tenor, r=args.rate, q=q, sigma=sigma)
-    if args.spot is None or args.sigma is None:
+    if args.spot is None:
         raise ValueError("pass --S and --sigma, or --ticker")
+    if args.sigma is None:
+        if args.model != "heston":
+            raise ValueError("pass --S and --sigma, or --ticker")
+        sigma = 0.2
+    else:
+        sigma = args.sigma
     q = 0.0 if args.div is None else args.div
-    return Market(S=args.spot, T=args.tenor, r=args.rate, q=q, sigma=args.sigma)
+    return Market(S=args.spot, T=args.tenor, r=args.rate, q=q, sigma=sigma)
+
+
+def _build_process(args: argparse.Namespace, market: Market) -> object | None:
+    if args.model == "gbm":
+        return None
+    if args.model == "heston":
+        from monte_carlo_option_engine.process import HestonProcess
+
+        if args.method == "sobol":
+            raise ValueError("HestonProcess does not support method='sobol'")
+        return HestonProcess(market, _heston_params(args))
+    if args.model == "localvol":
+        from monte_carlo_option_engine.local_vol import local_vol_from_surface
+        from monte_carlo_option_engine.process import LocalVolProcess
+
+        surface = getattr(args, "_surface", None)
+        if surface is None:
+            raise ValueError("--surface-ticker is required for --model localvol")
+        return LocalVolProcess(market, local_vol_from_surface(surface))
+    raise ValueError(f"unknown model {args.model}")
 
 
 def _build_contract(args: argparse.Namespace, spot: float) -> Contract:
@@ -142,18 +216,23 @@ def price_from_args(
 ) -> tuple[Contract, PriceResult, float | None]:
     market = _build_market(args)
     contract = _build_contract(args, market.S)
+    process = _build_process(args, market)
+    antithetic = args.antithetic
+    if args.method == "sobol":
+        antithetic = False
     result = price_mc(
         market,
         contract,
         steps=args.steps,
         trial_count=args.n_paths,
-        antithetic=args.antithetic,
+        antithetic=antithetic,
         control_variate=args.control_variate,
         method=args.method,
         seed=args.seed,
+        process=process,
     )
     bs: float | None = None
-    if ContractKind(contract.kind) in CLOSED_FORM_KINDS:
+    if args.model == "gbm" and ContractKind(contract.kind) in CLOSED_FORM_KINDS:
         bs = black_scholes(market, contract)
     return contract, result, bs
 
@@ -164,7 +243,7 @@ def cmd_price(args: argparse.Namespace) -> int:
     except (ValueError, TypeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    print(_format_result(contract, result, bs))
+    print(_format_result(contract, result, bs, args.control_variate))
     return 0
 
 

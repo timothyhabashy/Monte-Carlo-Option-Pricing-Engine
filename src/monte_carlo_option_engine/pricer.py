@@ -35,6 +35,7 @@ from monte_carlo_option_engine.payoffs import (
 from monte_carlo_option_engine.qmc import brownian_bridge
 from monte_carlo_option_engine.types import (
     CLOSED_FORM_KINDS,
+    EARLY_EXERCISE_KINDS,
     PATH_KINDS,
     TERMINAL_KINDS,
     UP_BARRIER_KINDS,
@@ -285,8 +286,19 @@ def _cv_path_y(kind: ContractKind, paths: np.ndarray, contract: Contract) -> np.
 
 
 def _paths_from_draws(
-    market: Market, z: np.ndarray, method: DrawMethod
+    market: Market, z: np.ndarray, method: DrawMethod, process: object | None = None
 ) -> np.ndarray:
+    if process is not None and getattr(process, "model_name", "") == "localvol":
+        if method == "sobol":
+            w = brownian_bridge(z, market.T)
+            steps = z.shape[0]
+            dt = market.T / steps if steps else 1.0
+            d_w = np.empty_like(w)
+            d_w[0] = w[0]
+            d_w[1:] = np.diff(w, axis=0)
+            z_inc = d_w / np.sqrt(max(dt, 1e-16))
+            return process.paths_from_shocks(z_inc)  # type: ignore[union-attr]
+        return process.paths_from_shocks(z)  # type: ignore[union-attr]
     if method == "sobol":
         w = brownian_bridge(z, market.T)
         return paths_from_brownian(market, w)
@@ -346,6 +358,7 @@ def _path_batch(
     stats: _Stats,
     use_cv: bool,
     method: DrawMethod,
+    process: object | None = None,
 ) -> None:
     def y_of(paths: np.ndarray) -> np.ndarray | None:
         if not use_cv:
@@ -353,19 +366,21 @@ def _path_batch(
         return discount * _cv_path_y(kind, paths, contract)
 
     def x_of(paths: np.ndarray) -> np.ndarray:
+        if kind in TERMINAL_KINDS:
+            return discount * _payoff_terminal(kind, paths[-1], contract)
         return discount * _payoff_path(kind, paths, contract, market, steps)
 
     if not antithetic or n == 1:
         z = source.draw(n)
-        paths = _paths_from_draws(market, z, method)
+        paths = _paths_from_draws(market, z, method, process)
         stats.add_individuals(x_of(paths), y_of(paths) if use_cv else None)
         return
 
     n_pairs = n // 2
     remainder = n % 2
     z = source.draw(n_pairs)
-    paths = _paths_from_draws(market, z, method)
-    paths_anti = _paths_from_draws(market, -z, method)
+    paths = _paths_from_draws(market, z, method, process)
+    paths_anti = _paths_from_draws(market, -z, method, process)
     stats.add_pairs(
         x_of(paths),
         x_of(paths_anti),
@@ -374,8 +389,151 @@ def _path_batch(
     )
     if remainder:
         z_extra = source.draw(1)
-        extra = _paths_from_draws(market, z_extra, method)
+        extra = _paths_from_draws(market, z_extra, method, process)
         stats.add_individuals(x_of(extra), y_of(extra) if use_cv else None)
+
+
+def _price_heston_contract(
+    market: Market,
+    contract: Contract,
+    process: object,
+    steps: int,
+    trial_count: int,
+    antithetic: bool,
+    control_variate: bool,
+    estimate_beta: bool,
+    method: DrawMethod,
+    rng: np.random.Generator,
+    seed: int | None,
+) -> PriceResult:
+    if method == "sobol":
+        raise ValueError("HestonProcess does not support method='sobol'")
+    from monte_carlo_option_engine.heston import (
+        _antithetic_shocks,
+        _draw_qe_shocks,
+        heston_put_cf,
+        price_heston_call,
+        simulate_heston_paths,
+        simulate_heston_terminal,
+    )
+    from monte_carlo_option_engine.payoffs import payoff_digital_call, payoff_digital_put, payoff_european_put
+
+    kind = ContractKind(contract.kind)
+    params = process.params  # type: ignore[union-attr]
+    martingale = getattr(process, "martingale_correction", True)
+    if kind is ContractKind.euro_call:
+        return price_heston_call(
+            market,
+            params,
+            contract.K,
+            steps=steps,
+            trial_count=trial_count,
+            antithetic=antithetic,
+            control_variate=control_variate,
+            estimate_beta=estimate_beta,
+            martingale_correction=martingale,
+            rng=None if seed is not None else rng,
+            seed=seed,
+        )
+
+    discount = float(np.exp(-market.r * market.T))
+    stats = _Stats()
+    expected_y: float | None = None
+    if kind is ContractKind.euro_put and control_variate:
+        expected_y = heston_put_cf(market, params, contract.K)
+    use_cv = expected_y is not None
+
+    def terminal_pay(spots: np.ndarray) -> np.ndarray:
+        if kind is ContractKind.euro_put:
+            return discount * payoff_european_put(spots, contract.K)
+        if kind is ContractKind.digital_call:
+            return discount * payoff_digital_call(spots, contract.K, contract.Q)
+        if kind is ContractKind.digital_put:
+            return discount * payoff_digital_put(spots, contract.K, contract.Q)
+        raise ValueError(f"unsupported Heston terminal kind: {kind}")
+
+    if kind in TERMINAL_KINDS:
+        if not antithetic or trial_count == 1:
+            spots = simulate_heston_terminal(
+                market, params, steps, trial_count, rng, martingale_correction=martingale
+            )
+            x = terminal_pay(spots)
+            stats.add_individuals(x, x if use_cv else None)
+        else:
+            n_pairs = trial_count // 2
+            remainder = trial_count % 2
+            shocks = _draw_qe_shocks(rng, steps, n_pairs)
+            spots = simulate_heston_terminal(
+                market,
+                params,
+                steps,
+                n_pairs,
+                rng,
+                martingale_correction=martingale,
+                shocks=shocks,
+            )
+            anti = _antithetic_shocks(*shocks)
+            spots_a = simulate_heston_terminal(
+                market,
+                params,
+                steps,
+                n_pairs,
+                rng,
+                martingale_correction=martingale,
+                shocks=anti,
+            )
+            x, xa = terminal_pay(spots), terminal_pay(spots_a)
+            stats.add_pairs(x, xa, x if use_cv else None, xa if use_cv else None)
+            if remainder:
+                extra = simulate_heston_terminal(
+                    market, params, steps, 1, rng, martingale_correction=martingale
+                )
+                xe = terminal_pay(extra)
+                stats.add_individuals(xe, xe if use_cv else None)
+        return stats.result(
+            seed, use_cv=use_cv, expected_y=expected_y or 0.0, estimate_beta=estimate_beta
+        )
+
+    steps = _positive_int(steps, "steps")
+
+    def path_pay(paths: np.ndarray) -> np.ndarray:
+        return discount * _payoff_path(kind, paths, contract, market, steps)
+
+    if not antithetic or trial_count == 1:
+        paths = simulate_heston_paths(
+            market, params, steps, trial_count, rng, martingale_correction=martingale
+        )
+        stats.add_individuals(path_pay(paths))
+    else:
+        n_pairs = trial_count // 2
+        remainder = trial_count % 2
+        shocks = _draw_qe_shocks(rng, steps, n_pairs)
+        paths = simulate_heston_paths(
+            market,
+            params,
+            steps,
+            n_pairs,
+            rng,
+            martingale_correction=martingale,
+            shocks=shocks,
+        )
+        anti = _antithetic_shocks(*shocks)
+        paths_a = simulate_heston_paths(
+            market,
+            params,
+            steps,
+            n_pairs,
+            rng,
+            martingale_correction=martingale,
+            shocks=anti,
+        )
+        stats.add_pairs(path_pay(paths), path_pay(paths_a))
+        if remainder:
+            extra = simulate_heston_paths(
+                market, params, steps, 1, rng, martingale_correction=martingale
+            )
+            stats.add_individuals(path_pay(extra))
+    return stats.result(seed)
 
 
 def price_mc(
@@ -390,38 +548,91 @@ def price_mc(
     method: DrawMethod = "iid",
     rng: np.random.Generator | None = None,
     seed: int | None = None,
+    process: object | None = None,
 ) -> PriceResult:
     """Monte Carlo pricer with batching, antithetic draws, and control variates.
 
     Antithetic standard errors use pair-average discounted payoffs. Europeans
     and digitals use Black–Scholes as a control; arithmetic Asians use the
-    geometric-Asian closed form. ``method='sobol'`` uses scrambled Sobol
-    (Brownian bridge on path-dependent contracts).
+    geometric-Asian closed form. Default vanilla CV makes the reported price
+    identical to the closed form (stderr ≈ 0). ``method='sobol'`` uses
+    scrambled Sobol (Brownian bridge on path-dependent contracts). Sobol
+    ``stderr`` is the usual sample SD — a heuristic, not an IID CLT SE.
+    ``method='sobol'`` cannot be combined with ``antithetic=True``.
+
+    ``process`` selects dynamics (GBM default, Heston, or local vol). BS/geo-Asian
+    control variates apply only to GBM.
     """
 
     if method not in ("iid", "sobol"):
         raise ValueError("method must be 'iid' or 'sobol'")
+    if method == "sobol" and antithetic:
+        raise ValueError("method='sobol' cannot be combined with antithetic=True")
     rng, used_seed = _resolve_rng(rng, seed)
     trial_count = _positive_int(trial_count, "trial_count")
     batch_size = _positive_int(batch_size, "batch_size")
     kind = ContractKind(contract.kind)
+    if process is None:
+        model = "gbm"
+    else:
+        model = getattr(process, "model_name", None)
+        if model not in ("gbm", "heston", "localvol"):
+            raise ValueError(f"unknown process {type(process)!r}")
+    if kind in EARLY_EXERCISE_KINDS:
+        from monte_carlo_option_engine.american import (
+            price_american_call,
+            price_american_put,
+        )
+
+        american_fn = (
+            price_american_call
+            if kind is ContractKind.american_call
+            else price_american_put
+        )
+        return american_fn(
+            market,
+            contract.K,
+            steps=steps,
+            trial_count=trial_count,
+            antithetic=antithetic,
+            rng=None if used_seed is not None else rng,
+            seed=used_seed,
+            process=process,
+        )
+    if model == "heston":
+        return _price_heston_contract(
+            market,
+            contract,
+            process,
+            steps,
+            trial_count,
+            antithetic,
+            control_variate,
+            estimate_beta,
+            method,
+            rng,
+            used_seed,
+        )
+
+    gbm_cv = control_variate and model == "gbm"
     discount = float(np.exp(-market.r * market.T))
-    if kind in PATH_KINDS:
+    path_like = kind in PATH_KINDS or model == "localvol"
+    if path_like:
         steps = _positive_int(steps, "steps")
-    expected_y = _cv_expected_y(market, contract, kind, steps, control_variate)
+    expected_y = _cv_expected_y(market, contract, kind, steps, gbm_cv)
     use_cv = expected_y is not None
     stats = _Stats()
-    dim = 1 if kind in TERMINAL_KINDS else steps
+    dim = steps if path_like else 1
     source = _NormalSource(dim, method, rng, used_seed)
 
     remaining = trial_count
     while remaining > 0:
         n = min(batch_size, remaining)
-        if kind in TERMINAL_KINDS:
+        if kind in TERMINAL_KINDS and model == "gbm":
             _terminal_batch(
                 market, contract, kind, n, antithetic, source, discount, stats, use_cv
             )
-        elif kind in PATH_KINDS:
+        elif kind in PATH_KINDS or model == "localvol":
             _path_batch(
                 market,
                 contract,
@@ -434,6 +645,7 @@ def price_mc(
                 stats,
                 use_cv,
                 method,
+                process,
             )
         else:
             raise ValueError(f"Unsupported contract kind: {kind}")
@@ -461,6 +673,7 @@ def print_price(
     method: DrawMethod = "iid",
     rng: np.random.Generator | None = None,
     seed: int | None = None,
+    process: object | None = None,
 ) -> PriceResult:
     """Print a formatted price line and return the ``PriceResult``."""
 
@@ -476,14 +689,20 @@ def print_price(
         method=method,
         rng=rng,
         seed=seed,
+        process=process,
     )
 
     def fmt(x: float) -> str:
         return f"{x:,.6f}"
 
+    suffix = (
+        " | MC (CV)"
+        if control_variate and ContractKind(contract.kind) in CLOSED_FORM_KINDS
+        else ""
+    )
     print(
         f"{str(contract.kind):<15} price={fmt(result.price)} | "
         f"95% CI [{fmt(result.ci_low)}, {fmt(result.ci_high)}] | "
-        f"stderr={fmt(result.stderr)}"
+        f"stderr={fmt(result.stderr)}{suffix}"
     )
     return result

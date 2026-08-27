@@ -1,14 +1,14 @@
 import pytest
 
 from monte_carlo_option_engine import Contract, ContractKind, Market
-from monte_carlo_option_engine.types import PATH_KINDS, TERMINAL_KINDS
+from monte_carlo_option_engine.types import EARLY_EXERCISE_KINDS, PATH_KINDS, TERMINAL_KINDS
 
 
 def test_version_is_string() -> None:
     from monte_carlo_option_engine import __version__
 
     assert isinstance(__version__, str)
-    assert __version__ == "0.5.0"
+    assert __version__ == "0.9.0"
 
 
 def test_negative_spot_rejected() -> None:
@@ -37,5 +37,7 @@ def test_unknown_kind_rejected() -> None:
 
 
 def test_kinds_are_partitioned() -> None:
-    assert set(TERMINAL_KINDS | PATH_KINDS) == set(ContractKind)
+    assert set(TERMINAL_KINDS | PATH_KINDS | EARLY_EXERCISE_KINDS) == set(ContractKind)
     assert TERMINAL_KINDS.isdisjoint(PATH_KINDS)
+    assert TERMINAL_KINDS.isdisjoint(EARLY_EXERCISE_KINDS)
+    assert PATH_KINDS.isdisjoint(EARLY_EXERCISE_KINDS)

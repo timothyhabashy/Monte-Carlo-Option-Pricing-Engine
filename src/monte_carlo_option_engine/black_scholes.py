@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 from scipy.stats import norm
 
-from monte_carlo_option_engine.types import Contract, ContractKind, Market
+from monte_carlo_option_engine.types import Contract, ContractKind, GreeksResult, Market
 
 
 def _d1_d2(market: Market, strike: float) -> tuple[float, float]:
@@ -57,6 +57,54 @@ def black_scholes(market: Market, contract: Contract) -> float:
     raise ValueError(
         "Black–Scholes only supports euro_call, euro_put, digital_call, digital_put"
     )
+
+
+def black_scholes_greeks(market: Market, contract: Contract) -> GreeksResult:
+    """Black–Scholes Δ, Γ, ν, θ (calendar), and ρ for European calls and puts."""
+
+    kind = ContractKind(contract.kind)
+    if kind not in (ContractKind.euro_call, ContractKind.euro_put):
+        raise ValueError("black_scholes_greeks supports euro_call and euro_put")
+    s, t, k, r, q, sigma = (
+        market.S,
+        market.T,
+        contract.K,
+        market.r,
+        market.q,
+        market.sigma,
+    )
+    if t <= 0:
+        if kind is ContractKind.euro_call:
+            delta = 1.0 if s > k else 0.0
+        else:
+            delta = -1.0 if s < k else 0.0
+        return GreeksResult(delta, 0.0, 0.0, 0.0, 0.0, method="closed_form")
+
+    d1, d2 = _d1_d2(market, k)
+    disc_q = float(np.exp(-q * t))
+    disc_r = float(np.exp(-r * t))
+    n_d1 = float(norm.pdf(d1))
+    sqrt_t = float(np.sqrt(t))
+    gamma = disc_q * n_d1 / (s * sigma * sqrt_t)
+    vega = s * disc_q * n_d1 * sqrt_t
+    theta_spot = -s * disc_q * n_d1 * sigma / (2.0 * sqrt_t)
+    if kind is ContractKind.euro_call:
+        delta = disc_q * float(norm.cdf(d1))
+        theta = (
+            theta_spot
+            - r * k * disc_r * float(norm.cdf(d2))
+            + q * s * disc_q * float(norm.cdf(d1))
+        )
+        rho = k * t * disc_r * float(norm.cdf(d2))
+    else:
+        delta = -disc_q * float(norm.cdf(-d1))
+        theta = (
+            theta_spot
+            + r * k * disc_r * float(norm.cdf(-d2))
+            - q * s * disc_q * float(norm.cdf(-d1))
+        )
+        rho = -k * t * disc_r * float(norm.cdf(-d2))
+    return GreeksResult(delta, gamma, vega, theta, rho, method="closed_form")
 
 
 def geometric_asian_call(market: Market, contract: Contract, steps: int) -> float:

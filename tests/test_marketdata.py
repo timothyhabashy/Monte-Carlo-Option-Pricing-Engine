@@ -100,3 +100,54 @@ def test_implied_vol_falls_back_to_historical(
     implied = market_from_yfinance("AAPL", T=0.5, r=0.04, vol_source="implied")
     historical = market_from_yfinance("AAPL", T=0.5, r=0.04, vol_source="historical")
     assert implied.sigma == pytest.approx(historical.sigma)
+
+
+@patch("monte_carlo_option_engine.marketdata.yf.Ticker")
+@patch("monte_carlo_option_engine.marketdata.yf.download")
+def test_surface_from_yfinance_mocked(
+    mock_download: MagicMock, mock_ticker_cls: MagicMock
+) -> None:
+    from monte_carlo_option_engine import surface_from_yfinance
+
+    mock_download.return_value = _close_history()
+    ticker = MagicMock()
+    ticker.info = {"dividendYield": 0.01}
+    ticker.options = ("2027-02-18", "2027-08-18")
+    chain = MagicMock()
+    chain.calls = pd.DataFrame(
+        {
+            "strike": [110.0, 120.0, 130.0],
+            "impliedVolatility": [0.28, 0.25, 0.22],
+            "bid": [1.0, 1.0, 1.0],
+            "ask": [1.2, 1.2, 1.2],
+        }
+    )
+    chain.puts = pd.DataFrame(
+        {
+            "strike": [90.0, 100.0, 110.0],
+            "impliedVolatility": [0.32, 0.29, 0.28],
+            "bid": [1.0, 1.0, 1.0],
+            "ask": [1.2, 1.2, 1.2],
+        }
+    )
+    ticker.option_chain.return_value = chain
+    mock_ticker_cls.return_value = ticker
+    surface = surface_from_yfinance("AAPL", r=0.04)
+    assert surface.S == pytest.approx(110.0)
+    assert surface.iv(110.0, float(surface.expiries[0])) > 0.0
+
+
+@patch("monte_carlo_option_engine.marketdata.yf.Ticker")
+@patch("monte_carlo_option_engine.marketdata.yf.download")
+def test_surface_from_yfinance_empty_chain_raises(
+    mock_download: MagicMock, mock_ticker_cls: MagicMock
+) -> None:
+    from monte_carlo_option_engine import surface_from_yfinance
+
+    mock_download.return_value = _close_history()
+    ticker = MagicMock()
+    ticker.info = {}
+    ticker.options = ()
+    mock_ticker_cls.return_value = ticker
+    with pytest.raises(ValueError, match="No option expiries"):
+        surface_from_yfinance("AAPL", r=0.04)

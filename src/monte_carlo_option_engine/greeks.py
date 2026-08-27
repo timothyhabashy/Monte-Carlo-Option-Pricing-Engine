@@ -6,7 +6,7 @@ from typing import Literal
 
 import numpy as np
 
-from monte_carlo_option_engine.gbm import terminal_from_shocks
+from monte_carlo_option_engine.gbm import paths_from_shocks, terminal_from_shocks
 from monte_carlo_option_engine.payoffs import (
     payoff_digital_call,
     payoff_digital_put,
@@ -15,6 +15,8 @@ from monte_carlo_option_engine.payoffs import (
 )
 from monte_carlo_option_engine.pricer import _resolve_rng, price_mc
 from monte_carlo_option_engine.types import (
+    ASIAN_KINDS,
+    BARRIER_KINDS,
     TERMINAL_KINDS,
     Contract,
     ContractKind,
@@ -104,43 +106,74 @@ def _pathwise_greeks(
     contract: Contract,
     trial_count: int,
     rng: np.random.Generator,
+    steps: int = 200,
 ) -> GreeksResult:
     kind = ContractKind(contract.kind)
     if kind in (ContractKind.digital_call, ContractKind.digital_put):
         raise ValueError(
             "pathwise greeks are not valid for digital payoffs; use likelihood_ratio"
         )
-    if kind not in (ContractKind.euro_call, ContractKind.euro_put):
-        raise ValueError("pathwise greeks are implemented for euro_call and euro_put")
+    if kind in BARRIER_KINDS:
+        raise ValueError("pathwise greeks are not valid for barrier payoffs")
     if market.T <= 0:
         return _bump_greeks(market, contract, trial_count, seed=0, steps=1)
 
-    z = rng.normal(size=trial_count)
-    spots = terminal_from_shocks(market, z)
-    w_t = np.sqrt(market.T) * z
     disc = np.exp(-market.r * market.T)
-    if kind is ContractKind.euro_call:
-        itm = spots > contract.K
+    if kind in (ContractKind.euro_call, ContractKind.euro_put):
+        z = rng.normal(size=trial_count)
+        spots = terminal_from_shocks(market, z)
+        w_t = np.sqrt(market.T) * z
+        if kind is ContractKind.euro_call:
+            itm = spots > contract.K
+            sign = 1.0
+        else:
+            itm = spots < contract.K
+            sign = -1.0
         d_pay = itm.astype(float)
+        delta_paths = disc * sign * d_pay * spots / market.S
+        vega_paths = disc * sign * d_pay * spots * (w_t - market.sigma * market.T)
+        delta = float(delta_paths.mean())
+        vega = float(vega_paths.mean())
+        se_d = float(delta_paths.std(ddof=1) / np.sqrt(trial_count)) if trial_count > 1 else 0.0
+        se_v = float(vega_paths.std(ddof=1) / np.sqrt(trial_count)) if trial_count > 1 else 0.0
+        return GreeksResult(
+            delta,
+            _NAN,
+            vega,
+            _NAN,
+            _NAN,
+            stderr_delta=se_d,
+            stderr_vega=se_v,
+            method="pathwise",
+        )
+
+    steps = max(int(steps), 1)
+    z = rng.normal(size=(steps, trial_count))
+    paths = paths_from_shocks(market, z)
+    if kind in ASIAN_KINDS:
+        avg = paths[1:].mean(axis=0)
+        itm = (avg > contract.K) if kind is ContractKind.asian_call else (avg < contract.K)
+        sign = 1.0 if kind is ContractKind.asian_call else -1.0
+        under = avg
+    elif kind is ContractKind.lookback_call:
+        under = paths.max(axis=0)
+        itm = under > contract.K
         sign = 1.0
     else:
-        itm = spots < contract.K
-        d_pay = itm.astype(float)
-        sign = -1.0
-    delta_paths = disc * sign * d_pay * spots / market.S
-    vega_paths = disc * sign * d_pay * spots * (w_t - market.sigma * market.T)
+        raise ValueError(
+            "pathwise greeks are implemented for europeans, arithmetic asians, "
+            "and fixed-strike lookback calls"
+        )
+    delta_paths = disc * sign * itm.astype(float) * under / market.S
     delta = float(delta_paths.mean())
-    vega = float(vega_paths.mean())
     se_d = float(delta_paths.std(ddof=1) / np.sqrt(trial_count)) if trial_count > 1 else 0.0
-    se_v = float(vega_paths.std(ddof=1) / np.sqrt(trial_count)) if trial_count > 1 else 0.0
     return GreeksResult(
         delta,
         _NAN,
-        vega,
+        _NAN,
         _NAN,
         _NAN,
         stderr_delta=se_d,
-        stderr_vega=se_v,
         method="pathwise",
     )
 
@@ -197,7 +230,8 @@ def greeks(
     """Estimate Greeks.
 
     ``bump`` uses common-random-number finite differences through ``price_mc``.
-    ``pathwise`` supports European calls and puts (delta and vega).
+    ``pathwise`` supports European calls/puts (delta and vega) and, on GBM,
+    arithmetic Asians and fixed-strike lookback calls (delta).
     ``likelihood_ratio`` supports terminal payoffs and is the method to use
     for digitals.
     """
@@ -217,5 +251,5 @@ def greeks(
             market, contract, trial_count, used_seed, steps, **bump_kwargs
         )
     if method == "pathwise":
-        return _pathwise_greeks(market, contract, trial_count, rng)
+        return _pathwise_greeks(market, contract, trial_count, rng, steps=steps)
     return _lr_greeks(market, contract, trial_count, rng)

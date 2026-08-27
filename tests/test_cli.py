@@ -35,6 +35,7 @@ def test_cli_euro_call_prints_price_and_bs(capsys) -> None:
     captured = capsys.readouterr()
     assert code == 0
     assert "BS euro_call:" in captured.out
+    assert "MC (CV)" in captured.out
     price = _price(captured.out)
     assert price > 0.0
     bs_match = re.search(r"BS euro_call: ([0-9,]+\.[0-9]+)", captured.out)
@@ -87,6 +88,48 @@ def test_cli_barrier_requires_B(capsys) -> None:
 
 def test_cli_barrier_prices(capsys) -> None:
     code = main(["price", "--kind", "up_and_out_call", "--B", "130", *_SYNTH])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert _price(captured.out) >= 0.0
+    assert "BS " not in captured.out
+
+
+def test_cli_heston_euro_call(capsys) -> None:
+    code = main(
+        [
+            "price",
+            "--kind",
+            "euro_call",
+            "--model",
+            "heston",
+            "--kappa",
+            "1.5",
+            "--theta",
+            "0.04",
+            "--xi",
+            "0.4",
+            "--rho",
+            "-0.5",
+            "--v0",
+            "0.04",
+            *_SYNTH,
+        ]
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "BS " not in captured.out
+    assert _price(captured.out) > 0.0
+
+
+def test_cli_heston_requires_params(capsys) -> None:
+    code = main(["price", "--kind", "euro_call", "--model", "heston", *_SYNTH])
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "--kappa" in captured.err
+
+
+def test_cli_american_put(capsys) -> None:
+    code = main(["price", "--kind", "american_put", *_SYNTH])
     captured = capsys.readouterr()
     assert code == 0
     assert _price(captured.out) >= 0.0

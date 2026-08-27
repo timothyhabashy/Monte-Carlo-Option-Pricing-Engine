@@ -2,9 +2,11 @@
 
 [![CI](https://github.com/timothyhabashy/Monte-Carlo-Option-Pricing-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/timothyhabashy/Monte-Carlo-Option-Pricing-Engine/actions/workflows/ci.yml)
 
-A GBM Monte Carlo pricer for common equity options. Pricing lives in the
+A Monte Carlo pricer for common equity options. Pricing lives in the
 `monte_carlo_option_engine` package (Python 3.13+); notebooks under `nbs/` are
-demo clients.
+demo clients. One-factor dynamics (GBM, Heston QE, Dupire local vol) share a
+`Process` interface so Asians, barriers, lookbacks, and Americans reuse the
+same payoffs. Baskets stay two-asset and outside that protocol.
 
 ## Features
 
@@ -12,10 +14,27 @@ demo clients.
   Asians, fixed-strike lookbacks, and the discrete knock-in/out barrier grid
 - Batching, antithetic variates (pair-average SEs), and control variates
   (Black–Scholes for vanillas/digitals; geometric Asian for arithmetic Asians)
-- Optional scrambled Sobol QMC (`method="sobol"`) with a Brownian bridge on paths
-- Greeks: bump (CRN), pathwise Δ/ν for Europeans, likelihood ratio for digitals
-- Barriers: discrete monitoring, or continuous via a BGK shift
-- Longstaff–Schwartz American puts; correlated basket / best-of calls; Heston QE
+- Optional scrambled Sobol QMC (`method="sobol"`) with a Brownian bridge on paths.
+  Sobol cannot be combined with antithetic draws; reported Sobol stderr is a
+  heuristic sample SD, not an IID CLT interval.
+- Default vanilla/digital control variates make the Monte Carlo price identical
+  to the closed form (stderr ≈ 0). Pass `control_variate=False` to see raw MC.
+- Greeks: `black_scholes_greeks`; bump (CRN); pathwise Δ/ν for Europeans and
+  pathwise Δ for arithmetic Asians and fixed-strike lookbacks (GBM);
+  likelihood ratio for digitals; `heston_greeks_cf` (finite-difference of the
+  Heston CF in S, v0, and ρ)
+- Barriers: discrete monitoring, or continuous via a BGK shift (Reiner–Rubinstein
+  closed form available as `barrier_closed_form`)
+- Longstaff–Schwartz American puts and calls (`american_put` / `american_call`),
+  even/odd out-of-sample regression, optional `basis="laguerre"`; CRR tree in
+  `crr_american_put`; correlated basket / best-of calls
+- Heston QE with CF control and Andersen K0 correction; implied-vol surface,
+  `calibrate_heston`, and Dupire local vol
+- `price_mc(..., process=GBMProcess|HestonProcess|LocalVolProcess)` — default
+  `process=None` is GBM. Heston ignores `market.sigma`; Sobol is GBM/local-vol
+  only
+- CLI `--model {gbm,heston,localvol}` (Heston needs `--kappa --theta --xi --rho --v0`;
+  local vol needs `--surface-ticker`)
 - `PriceResult`: price, standard error, 95% CI, path count, optional seed
 - Closed forms: European call/put, digital call/put, geometric Asian call/put
 - `market_from_yfinance(..., vol_source="historical"|"implied")`
@@ -57,10 +76,46 @@ Greeks, American puts, Heston calls, and baskets use the same `Market` /
 `Contract` types:
 
 ```python
-from monte_carlo_option_engine import greeks, price_american_put
+from monte_carlo_option_engine import (
+    Contract,
+    ContractKind,
+    HestonParams,
+    HestonProcess,
+    LocalVolProcess,
+    calibrate_heston,
+    greeks,
+    local_vol_from_surface,
+    price_american_put,
+    price_mc,
+    surface_from_flat,
+)
 
 print(greeks(market, call, method="pathwise", trial_count=20_000, seed=0))
 print(price_american_put(market, strike=105, seed=0).price)
+print(
+    price_mc(
+        market,
+        Contract(105, ContractKind.asian_call),
+        process=HestonProcess(
+            market, HestonParams(kappa=1.5, theta=0.04, xi=0.5, rho=-0.5, v0=0.04)
+        ),
+        trial_count=8_000,
+        seed=0,
+    ).price
+)
+
+surface = surface_from_flat(market.S, market.r, market.q, market.sigma)
+print(calibrate_heston(surface).params)
+print(
+    price_mc(
+        market,
+        call,
+        process=LocalVolProcess(market, local_vol_from_surface(surface)),
+        trial_count=8_000,
+        seed=0,
+        control_variate=False,
+    ).price
+)
 ```
 
 ## Command line
@@ -79,11 +134,16 @@ uv run mcoe price --ticker AAPL --kind euro_call --moneyness 1.05 --T 0.5 --r 0.
 ```
 
 The command prints the kind, Monte Carlo price, 95% CI, stderr, and a
-Black–Scholes line when a closed form exists. Barrier kinds need `--B`;
-`--vol-source implied` interpolates the option chain (falls back to historical).
+Black–Scholes line when a closed form exists under GBM. Barrier kinds need
+`--B`; `--vol-source implied` interpolates the option chain (falls back to
+historical). `--method sobol` turns antithetic off.
 
-American puts, Heston, and baskets stay on the Python API (`price_american_put`,
-`price_heston_call`, `price_basket_call`).
+```bash
+uv run mcoe price --kind euro_call --model heston \
+  --S 100 --K 100 --T 0.5 --r 0.03 --kappa 1.5 --theta 0.04 --xi 0.5 --rho -0.5 --v0 0.04 --n 20000
+```
+
+Baskets stay on the Python API (`price_basket_call`).
 
 ## Streamlit UI
 
@@ -92,9 +152,9 @@ uv sync --extra ui --group dev
 uv run --extra ui streamlit run scripts/streamlit_app.py
 ```
 
-Sliders for spot, strike, vol, tenor, and path count; a contract dropdown;
-sample GBM paths; and a Monte Carlo vs Black–Scholes table when a closed form
-exists.
+Sliders for model (GBM / Heston), spot, strike, vol, tenor, and path count; a
+contract dropdown (`american_put`, `heston_call`, and the GBM kinds); sample
+GBM paths; and a Monte Carlo vs closed-form table when one exists.
 
 ## Notebooks
 
@@ -106,6 +166,16 @@ exists.
 
 CI runs `uv run pytest -m "not network"` on every push and pull request.
 Live Yahoo tests are marked `network` and stay off by default.
+
+## Greeks
+
+| Method | Kinds | Process | Notes |
+| --- | --- | --- | --- |
+| `black_scholes_greeks` | euro call/put | GBM | Δ Γ ν θ ρ |
+| `greeks(..., method="bump")` | any `price_mc` kind | same as `price_mc` | CRN finite differences |
+| `greeks(..., method="pathwise")` | euro call/put (Δ ν); asian call/put and lookback call (Δ) | GBM | rejects digitals and barriers |
+| `greeks(..., method="likelihood_ratio")` | terminal payoffs | GBM | use this for digitals |
+| `heston_greeks_cf` | Heston European call | Heston CF | `vega` is ∂C/∂v0; `rho` is ∂C/∂ρ |
 
 ## Notes
 

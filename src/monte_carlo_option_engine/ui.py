@@ -6,8 +6,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from monte_carlo_option_engine.black_scholes import black_scholes
+from monte_carlo_option_engine.heston import HestonParams, heston_call_cf
 from monte_carlo_option_engine.plotting import plot_paths
 from monte_carlo_option_engine.pricer import price_mc
+from monte_carlo_option_engine.process import HestonProcess
 from monte_carlo_option_engine.types import (
     BARRIER_KINDS,
     CLOSED_FORM_KINDS,
@@ -25,11 +27,18 @@ def main() -> None:
 
     st.set_page_config(page_title="Monte Carlo Option Engine", layout="centered")
     st.title("Monte Carlo Option Engine")
-    st.caption("GBM pricer with optional Black–Scholes comparison.")
+    st.caption("GBM or Heston pricer; local vol is on the CLI (``--model localvol``).")
 
-    kinds = [k.value for k in ContractKind]
-    kind_name = st.selectbox("Contract", kinds, index=kinds.index("euro_call"))
-    kind = ContractKind(kind_name)
+    model = st.selectbox("Model", ["gbm", "heston"], index=0)
+    kind_options = [k.value for k in ContractKind]
+    if "heston_call" not in kind_options:
+        kind_options = ["heston_call", *kind_options]
+    kind_name = st.selectbox("Contract", kind_options, index=kind_options.index("euro_call"))
+    if kind_name == "heston_call":
+        model = "heston"
+        kind = ContractKind.euro_call
+    else:
+        kind = ContractKind(kind_name)
 
     col_a, col_b = st.columns(2)
     with col_a:
@@ -42,6 +51,19 @@ def main() -> None:
         sigma = st.slider("Vol σ", min_value=0.01, max_value=1.0, value=0.25, step=0.01)
         n_paths = st.slider("Paths", min_value=1_000, max_value=50_000, value=8_000, step=1_000)
         steps = st.slider("Steps", min_value=10, max_value=400, value=100, step=10)
+
+    params = None
+    if model == "heston":
+        st.subheader("Heston")
+        h1, h2 = st.columns(2)
+        with h1:
+            kappa = st.slider("κ", min_value=0.1, max_value=10.0, value=1.5, step=0.1)
+            theta = st.slider("θ", min_value=0.01, max_value=0.25, value=0.04, step=0.01)
+            xi = st.slider("ξ", min_value=0.01, max_value=2.0, value=0.5, step=0.01)
+        with h2:
+            rho = st.slider("ρ", min_value=-0.99, max_value=0.99, value=-0.5, step=0.01)
+            v0 = st.slider("v0", min_value=0.01, max_value=0.25, value=0.04, step=0.01)
+        params = HestonParams(kappa=kappa, theta=theta, xi=xi, rho=rho, v0=v0)
 
     barrier = None
     if kind in BARRIER_KINDS:
@@ -59,6 +81,7 @@ def main() -> None:
         B=float(barrier) if barrier is not None else None,
         monitoring=monitoring_name,
     )
+    process = HestonProcess(market, params) if params is not None else None
 
     if st.button("Price", type="primary"):
         result = price_mc(
@@ -67,6 +90,7 @@ def main() -> None:
             steps=int(steps),
             trial_count=int(n_paths),
             seed=0,
+            process=process,
         )
         rows = [
             {
@@ -77,7 +101,7 @@ def main() -> None:
                 "ci_high": result.ci_high,
             }
         ]
-        if kind in CLOSED_FORM_KINDS:
+        if model == "gbm" and kind in CLOSED_FORM_KINDS:
             bs = black_scholes(market, contract)
             rows.append(
                 {
@@ -86,6 +110,17 @@ def main() -> None:
                     "stderr": 0.0,
                     "ci_low": bs,
                     "ci_high": bs,
+                }
+            )
+        if model == "heston" and kind is ContractKind.euro_call and params is not None:
+            cf = heston_call_cf(market, params, float(strike))
+            rows.append(
+                {
+                    "source": "Heston CF",
+                    "price": cf,
+                    "stderr": 0.0,
+                    "ci_low": cf,
+                    "ci_high": cf,
                 }
             )
         st.dataframe(rows, hide_index=True)

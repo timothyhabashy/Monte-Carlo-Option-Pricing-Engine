@@ -1,9 +1,11 @@
+import numpy as np
 import pytest
 
 from monte_carlo_option_engine import (
     Contract,
     ContractKind,
     Market,
+    barrier_closed_form,
     black_scholes,
     price_mc,
 )
@@ -70,3 +72,39 @@ def test_continuous_up_and_out_not_above_discrete(market: Market, strike: float)
     disc = price_mc(market, discrete, **kwargs)
     cont = price_mc(market, continuous, **kwargs)
     assert cont.price <= disc.price + 1e-12
+
+
+def test_far_down_barrier_call_is_vanilla() -> None:
+    market = Market(S=100.0, T=1.0, r=0.08, q=0.04, sigma=0.25)
+    vanilla = black_scholes(market, Contract(90.0, ContractKind.euro_call))
+    far = barrier_closed_form(
+        market, Contract(90.0, ContractKind.down_and_out_call, B=1.0)
+    )
+    assert far == pytest.approx(vanilla, rel=1e-10)
+
+
+def test_barrier_in_out_parity_closed_form(market: Market, strike: float) -> None:
+    vanilla = black_scholes(market, Contract(strike, ContractKind.euro_call))
+    uo = barrier_closed_form(
+        market, Contract(strike, ContractKind.up_and_out_call, B=115.0)
+    )
+    ui = barrier_closed_form(
+        market, Contract(strike, ContractKind.up_and_in_call, B=115.0)
+    )
+    assert uo + ui == pytest.approx(vanilla, rel=1e-10)
+
+
+def test_continuous_mc_near_reiner_rubinstein(market: Market, strike: float) -> None:
+    contract = Contract(
+        strike, ContractKind.up_and_out_call, B=115.0, monitoring="continuous"
+    )
+    closed = barrier_closed_form(market, contract)
+    result = price_mc(
+        market,
+        contract,
+        steps=200,
+        trial_count=20_000,
+        seed=0,
+        control_variate=False,
+    )
+    assert abs(result.price - closed) < 0.05

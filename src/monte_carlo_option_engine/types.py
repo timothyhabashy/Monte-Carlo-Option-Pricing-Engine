@@ -24,6 +24,8 @@ class ContractKind(StrEnum):
     up_and_in_put = "up_and_in_put"
     down_and_out_put = "down_and_out_put"
     down_and_in_put = "down_and_in_put"
+    american_put = "american_put"
+    american_call = "american_call"
 
 
 class Monitoring(StrEnum):
@@ -75,6 +77,9 @@ DOWN_BARRIER_KINDS: frozenset[ContractKind] = frozenset(
 BARRIER_KINDS: frozenset[ContractKind] = UP_BARRIER_KINDS | DOWN_BARRIER_KINDS
 ASIAN_KINDS: frozenset[ContractKind] = frozenset(
     {ContractKind.asian_call, ContractKind.asian_put}
+)
+EARLY_EXERCISE_KINDS: frozenset[ContractKind] = frozenset(
+    {ContractKind.american_put, ContractKind.american_call}
 )
 CLOSED_FORM_KINDS: frozenset[ContractKind] = frozenset(
     {

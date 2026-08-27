@@ -38,6 +38,18 @@ def test_sobol_euro_call_within_four_se(market, strike: float) -> None:
     assert_within_se(result.price, bs, result.stderr)
 
 
+def test_sobol_rejects_antithetic(market, strike: float) -> None:
+    with pytest.raises(ValueError, match="sobol"):
+        price_mc(
+            market,
+            Contract(strike, ContractKind.euro_call),
+            trial_count=16,
+            method="sobol",
+            antithetic=True,
+            control_variate=False,
+        )
+
+
 def test_invalid_draw_method(market, strike: float) -> None:
     with pytest.raises(ValueError, match="method"):
         price_mc(
@@ -46,3 +58,4 @@ def test_invalid_draw_method(market, strike: float) -> None:
             trial_count=10,
             method="halton",  # type: ignore[arg-type]
         )
+
